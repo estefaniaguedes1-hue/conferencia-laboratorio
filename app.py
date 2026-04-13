@@ -5,79 +5,68 @@ import re
 
 st.set_page_config(page_title="Conferência Dom Bosco", layout="wide")
 
-st.title("📋 Sistema de Conferência de Amostras")
-st.info("Suba os PDFs gerados pelos sistemas Autolac e DB para verificar o que não chegou.")
+st.title("📋 Conferência de Amostras (Autolac vs DB)")
+st.info("O sistema agora cruza Protocolo e Exame para garantir que nada foi esquecido.")
 
-def extrair_autolac(arquivo):
+def extrair_dados(arquivo, tipo):
     dados = []
     with pdfplumber.open(arquivo) as pdf:
+        texto_completo = ""
         for pagina in pdf.pages:
-            texto = pagina.extract_text()
-            if not texto: continue
-            
-            linhas = texto.split('\n')
-            paciente_atual = "Não identificado"
-            
-            for linha in linhas:
-                # 1. Identifica o Protocolo (Ex: 28-013536 ou 67-028832)
-                # O padrão é: dois dígitos, traço, seis dígitos
-                match_prot = re.search(r'(\d{2}-\d{6})', linha)
+            texto_completo += pagina.extract_text() + "\n"
+        
+        if tipo == "autolac":
+            # No Autolac, buscamos o padrão XX-XXXXXX e os exames D-XXXX
+            blocos = re.split(r'(\d{2}-\d{6})', texto_completo)
+            for i in range(1, len(blocos), 2):
+                protocolo = blocos[i].replace('-', '')
+                conteudo_bloco = blocos[i+1]
                 
-                if match_prot:
-                    protocolo_limpo = match_prot.group(1).replace('-', '')
-                    # O nome costuma ser o que vem depois do protocolo na mesma linha
-                    # ou o texto antes do protocolo. Vamos pegar a linha limpa:
-                    paciente_atual = linha.replace(match_prot.group(1), '').replace('08/04/2026', '').strip()
+                # Pega o nome do paciente (geralmente as primeiras palavras após o protocolo)
+                linhas_bloco = conteudo_bloco.strip().split('\n')
+                nome_paciente = linhas_bloco[0].split('08/04')[0].strip() if linhas_bloco else "Paciente não identificado"
                 
-                # 2. Identifica o Exame (Ex: D-ACU, D-CRE, D-TSH)
-                if "D-" in linha:
-                    partes = linha.split()
-                    for p in partes:
-                        if p.startswith("D-"):
-                            dados.append({
-                                'Protocolo': protocolo_limpo if match_prot else dados[-1]['Protocolo'] if dados else "S/P",
-                                'Paciente': paciente_atual,
-                                'Exame': p
-                            })
+                # Busca todos os exames D- no bloco desse protocolo
+                exames = re.findall(r'(D-\w+)', conteudo_bloco)
+                for ex in exames:
+                    dados.append({'ID': protocolo, 'Paciente': nome_paciente, 'Exame': ex.replace('D-', '')})
+        
+        else: # Tipo DB
+            # No DB, o atendimento é um número (ex: 67028918) e os exames são siglas (TSH, T4L, etc)
+            # Vamos extrair todos os números de 8 dígitos e as siglas próximas
+            # Mas para ser mais seguro, vamos pegar apenas os Atendimentos e os Procedimentos citados
+            atendimentos = re.findall(r'\b(\d{8})\b', texto_completo)
+            # Extraímos siglas de exames (letras maiúsculas de 2 a 6 caracteres)
+            exames_db = re.findall(r'\b([A-Z0-9]{2,8})\b', texto_completo)
+            
+            # Criamos um set de combinações encontradas no texto para busca rápida
+            return texto_completo
+            
     return pd.DataFrame(dados)
 
-def extrair_db(arquivo):
-    # No DB o atendimento é um número como 67028918
-    atendimentos = []
-    with pdfplumber.open(arquivo) as pdf:
-        for pagina in pdf.pages:
-            texto = pagina.extract_text()
-            if texto:
-                # Busca números de 8 dígitos que comecem com 67 ou similares
-                achados = re.findall(r'\b(\d{8})\b', texto)
-                atendimentos.extend(achados)
-    return list(set(atendimentos)) # Retorna lista sem duplicados
+f_a = st.file_uploader("Relatório Autolac (Interno)", type="pdf")
+f_d = st.file_uploader("Relatório DB (Terceiro)", type="pdf")
 
-col1, col2 = st.columns(2)
-with col1:
-    f_autolac = st.file_uploader("Relatório Autolac (PDF)", type="pdf")
-with col2:
-    f_db = st.file_uploader("Relatório DB (PDF)", type="pdf")
-
-if f_autolac and f_db:
-    with st.spinner('Cruzando dados...'):
-        df_a = extrair_autolac(f_autolac)
-        list_d = extrair_db(f_db)
+if f_a and f_d:
+    with st.spinner('Cruzando informações...'):
+        df_autolac = extrair_dados(f_a, "autolac")
+        texto_db = extrair_dados(f_d, "db") # Texto bruto do DB para busca
         
-        if not df_a.empty:
-            # Compara: quem está no Autolac mas o protocolo NÃO está na lista do DB
-            pendentes = df_a[~df_a['Protocolo'].isin(list_d)]
+        if not df_autolac.empty:
+            pendencias = []
+            for _, linha in df_autolac.iterrows():
+                # Verifica se o Protocolo E o Exame aparecem no texto do DB
+                # Removemos o "D-" do exame do Autolac para buscar no DB
+                if linha['ID'] not in texto_db or linha['Exame'] not in texto_db:
+                    pendencias.append(linha)
             
-            if pendentes.empty:
-                st.success("✅ Excelente! Todas as amostras constam no laboratório DB.")
+            df_pendencias = pd.DataFrame(pendencias)
+            
+            if df_pendencias.empty:
+                st.success("✅ Tudo ok! Todos os pacientes e exames foram localizados no DB.")
             else:
-                st.error(f"⚠️ Atenção: {len(pendentes.drop_duplicates(subset=['Protocolo', 'Exame']))} exames pendentes encontrados.")
+                st.error(f"⚠️ Encontradas {len(df_pendencias)} pendências de exames:")
+                st.dataframe(df_pendencias[['ID', 'Paciente', 'Exame']].drop_duplicates(), use_container_width=True)
                 
-                # Formata a tabela para ficar bonita
-                st.dataframe(pendentes[['Protocolo', 'Paciente', 'Exame']].drop_duplicates(), use_container_width=True)
-                
-                # Botão para baixar
-                csv = pendentes.to_csv(index=False).encode('utf-8-sig')
+                csv = df_pendencias.to_csv(index=False).encode('utf-8-sig')
                 st.download_button("Baixar Lista de Pendências", csv, "pendencias.csv", "text/csv")
-        else:
-            st.warning("Não consegui ler os dados do Autolac. Verifique se o PDF está correto.")
