@@ -5,63 +5,79 @@ import re
 
 st.set_page_config(page_title="Conferência Dom Bosco", layout="wide")
 
-st.title("📋 Conferência de Amostras (Autolac vs DB)")
+st.title("📋 Sistema de Conferência de Amostras")
+st.info("Suba os PDFs gerados pelos sistemas Autolac e DB para verificar o que não chegou.")
 
-def extrair_dados_autolac(pdf_path):
+def extrair_autolac(arquivo):
     dados = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            # Encontra o padrão de Protocolo (ex: 01-815104) e o nome que vem antes/depois
-            # Ajustado para o layout do seu PDF
-            lines = text.split('\n')
-            for i, line in enumerate(lines):
-                if "Protocolo" in line: continue
-                # Procura por números no formato XX-XXXXXX
-                match = re.search(r'(\d{2}-\d{6})', line)
-                if match:
-                    protocolo = match.group(1).replace('-', '')
-                    # O nome do paciente geralmente está na mesma linha ou na anterior
-                    paciente = line.replace(match.group(1), '').strip()
-                    # Tenta pegar os exames nas linhas seguintes até o próximo paciente
-                    exames = []
-                    for j in range(i+1, min(i+10, len(lines))):
-                        if "D-" in lines[j]: # Seus exames começam com D-
-                            exames.append(lines[j].split()[0])
-                        if re.search(r'\d{2}-\d{6}', lines[j]): break
-                    
-                    for ex em exames:
-                        dados.append({'protocolo': protocolo, 'paciente': paciente, 'exame': ex})
+    with pdfplumber.open(arquivo) as pdf:
+        for pagina in pdf.pages:
+            texto = pagina.extract_text()
+            if not texto: continue
+            
+            linhas = texto.split('\n')
+            paciente_atual = "Não identificado"
+            
+            for linha in linhas:
+                # 1. Identifica o Protocolo (Ex: 28-013536 ou 67-028832)
+                # O padrão é: dois dígitos, traço, seis dígitos
+                match_prot = re.search(r'(\d{2}-\d{6})', linha)
+                
+                if match_prot:
+                    protocolo_limpo = match_prot.group(1).replace('-', '')
+                    # O nome costuma ser o que vem depois do protocolo na mesma linha
+                    # ou o texto antes do protocolo. Vamos pegar a linha limpa:
+                    paciente_atual = linha.replace(match_prot.group(1), '').replace('08/04/2026', '').strip()
+                
+                # 2. Identifica o Exame (Ex: D-ACU, D-CRE, D-TSH)
+                if "D-" in linha:
+                    partes = linha.split()
+                    for p in partes:
+                        if p.startswith("D-"):
+                            dados.append({
+                                'Protocolo': protocolo_limpo if match_prot else dados[-1]['Protocolo'] if dados else "S/P",
+                                'Paciente': paciente_atual,
+                                'Exame': p
+                            })
     return pd.DataFrame(dados)
 
-def extrair_dados_db(pdf_path):
-    dados = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            # No DB, o atendimento é um número sequencial longo
-            # Procuramos por "Atendimento" e pegamos o número abaixo ou ao lado
-            atendimentos = re.findall(r'(\d{8,10})', text)
-            for at em atendimentos:
-                dados.append({'atendimento': at})
-    return pd.DataFrame(dados)
+def extrair_db(arquivo):
+    # No DB o atendimento é um número como 67028918
+    atendimentos = []
+    with pdfplumber.open(arquivo) as pdf:
+        for pagina in pdf.pages:
+            texto = pagina.extract_text()
+            if texto:
+                # Busca números de 8 dígitos que comecem com 67 ou similares
+                achados = re.findall(r'\b(\d{8})\b', texto)
+                atendimentos.extend(achados)
+    return list(set(atendimentos)) # Retorna lista sem duplicados
 
-file_a = st.file_uploader("Suba o PDF do Autolac", type="pdf")
-file_d = st.file_uploader("Suba o PDF do DB", type="pdf")
+col1, col2 = st.columns(2)
+with col1:
+    f_autolac = st.file_uploader("Relatório Autolac (PDF)", type="pdf")
+with col2:
+    f_db = st.file_uploader("Relatório DB (PDF)", type="pdf")
 
-if file_a and file_d:
-    with st.spinner('Processando relatórios...'):
-        df_autolac = extrair_dados_autolac(file_a)
-        df_db = extrair_dados_db(file_d)
+if f_autolac and f_db:
+    with st.spinner('Cruzando dados...'):
+        df_a = extrair_autolac(f_autolac)
+        list_d = extrair_db(f_db)
         
-        if not df_autolac.empty and not df_db.empty:
-            # Compara
-            pendentes = df_autolac[~df_autolac['protocolo'].isin(df_db['atendimento'])]
+        if not df_a.empty:
+            # Compara: quem está no Autolac mas o protocolo NÃO está na lista do DB
+            pendentes = df_a[~df_a['Protocolo'].isin(list_d)]
             
             if pendentes.empty:
-                st.success("✅ Todas as amostras do Autolac foram encontradas no DB!")
+                st.success("✅ Excelente! Todas as amostras constam no laboratório DB.")
             else:
-                st.error(f"🚨 Encontradas {len(pendentes.drop_duplicates('protocolo'))} amostras pendentes!")
-                st.dataframe(pendentes[['protocolo', 'paciente', 'exame']].drop_duplicates())
+                st.error(f"⚠️ Atenção: {len(pendentes.drop_duplicates(subset=['Protocolo', 'Exame']))} exames pendentes encontrados.")
+                
+                # Formata a tabela para ficar bonita
+                st.dataframe(pendentes[['Protocolo', 'Paciente', 'Exame']].drop_duplicates(), use_container_width=True)
+                
+                # Botão para baixar
+                csv = pendentes.to_csv(index=False).encode('utf-8-sig')
+                st.download_button("Baixar Lista de Pendências", csv, "pendencias.csv", "text/csv")
         else:
-            st.warning("Não foi possível extrair dados. Verifique se os PDFs são os relatórios originais.")
+            st.warning("Não consegui ler os dados do Autolac. Verifique se o PDF está correto.")
